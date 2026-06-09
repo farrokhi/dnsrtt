@@ -5,7 +5,7 @@ go 1.26.3
 require (
 	github.com/AdguardTeam/dnsproxy v0.81.4
 	github.com/miekg/dns v1.1.72
-	github.com/spf13/cobra v1.10.1
+	github.com/spf13/cobra v1.10.2
 )
 
 require (
