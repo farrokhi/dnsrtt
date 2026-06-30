@@ -58,6 +58,7 @@ Flags:
 -t, --timeout duration     per-query timeout (default 5s)
 -T, --transports strings   transports to test: do53,dot,doq,doh2,doh3 (default do53,doq,doh3)
     --no-warmup            do not send an untimed warm-up query first
+-v, --version              print version and exit
 ```
 
 The resolver IP is pinned separately from the hostname so that every encrypted
