@@ -73,6 +73,12 @@ type Result struct {
 
 	// SetupErr is set when the target could not be constructed at all.
 	SetupErr error
+
+	// ProbeErr is set when the first query to the target failed, e.g. a TLS
+	// handshake the server rejects or a transport it does not support.  When it
+	// is set the timed loop is skipped so a dead transport returns after one
+	// timeout instead of count*timeout.
+	ProbeErr error
 }
 
 // Run measures every target in order using the shared config and returns one
@@ -111,8 +117,14 @@ func runTarget(cfg Config, t Target) (res Result) {
 	defer func() { _ = u.Close() }()
 
 	if cfg.Warmup {
-		// The result is intentionally ignored; this only primes the connection.
-		_, _ = u.Exchange(newReq(cfg.Names[0]))
+		// The warm-up doubles as a reachability probe: if the first exchange
+		// fails (e.g. a TLS name mismatch or an unsupported transport), give up
+		// on this target instead of timing out on every query.
+		if _, err = u.Exchange(newReq(cfg.Names[0])); err != nil {
+			res.ProbeErr = err
+
+			return res
+		}
 	}
 
 	res.Durations = make([]time.Duration, 0, cfg.Count)
@@ -128,6 +140,14 @@ func runTarget(cfg Config, t Target) (res Result) {
 		elapsed := time.Since(start)
 
 		if err != nil {
+			// Without a warm-up probe, the first failing query stands in for it
+			// so an unreachable transport still aborts early.
+			if i == 0 && !cfg.Warmup {
+				res.ProbeErr = err
+
+				return res
+			}
+
 			res.Errors++
 
 			continue
