@@ -33,6 +33,9 @@ type Stats struct {
 
 	// SetupErr is set when the target failed to build.
 	SetupErr error
+
+	// ProbeErr is set when the target was skipped after its first query failed.
+	ProbeErr error
 }
 
 // Summarize computes [Stats] from r.
@@ -43,6 +46,7 @@ func (r Result) Summarize() (s Stats) {
 		Errors:   r.Errors,
 		Redials:  r.Redials,
 		SetupErr: r.SetupErr,
+		ProbeErr: r.ProbeErr,
 	}
 
 	if len(r.Durations) == 0 {

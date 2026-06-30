@@ -4,7 +4,9 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"strings"
@@ -17,7 +19,7 @@ import (
 )
 
 // version is the released version of dnsrtt.
-const version = "1.0.0"
+const version = "1.1.0"
 
 // defaultNames is a small rotating set of popular, cacheable domains.  Keeping
 // them cached server-side strips recursion variance and leaves mostly transport
@@ -28,11 +30,39 @@ var defaultNames = []string{
 	"youtube.com", "facebook.com",
 }
 
-// transportBuilder turns a pinned resolver IP and TLS hostname into a target.
+// preset is a known public resolver: a TLS hostname paired with a canonical
+// anycast IP that serves a certificate for it.  Pinning both keeps presets
+// self-contained, so selecting one does not depend on system DNS.
+type preset struct {
+	name string
+	host string
+	ip   string
+}
+
+// presets are the built-in providers, quad9 first.  buildTargets and the help
+// text iterate this slice so the order is stable.
+var presets = []preset{
+	{"quad9", "dns.quad9.net", "9.9.9.9"},
+	{"cloudflare", "cloudflare-dns.com", "1.1.1.1"},
+	{"google", "dns.google", "8.8.8.8"},
+	{"adguard", "dns.adguard-dns.com", "94.140.14.14"},
+}
+
+// presetNames lists the preset keys in order for help and error messages.
+func presetNames() string {
+	names := make([]string, len(presets))
+	for i, p := range presets {
+		names[i] = p.name
+	}
+
+	return strings.Join(names, ", ")
+}
+
+// transportBuilder turns a TLS hostname into a target.  The resolver IP is
+// pinned separately via the bootstrap, so every transport hits the same server.
 type transportBuilder func(host string) bench.Target
 
-// transports maps a CLI key to the target it builds.  The resolver IP is pinned
-// separately via the bootstrap, so every transport hits the same server.
+// transports maps a CLI key to the target it builds.
 var transports = map[string]transportBuilder{
 	"do53": func(host string) bench.Target {
 		return bench.Target{Name: "Do53", Addr: host + ":53"}
@@ -59,36 +89,42 @@ var transports = map[string]transportBuilder{
 	},
 }
 
+// encryptedKeys are the transport keys that need a TLS hostname and so cannot
+// run against a bare IP target.
+var encryptedKeys = map[string]bool{"dot": true, "doq": true, "doh2": true, "doh3": true}
+
 func main() {
 	var (
-		resolver  string
-		hostname  string
-		count     int
-		gap       time.Duration
-		timeout   time.Duration
-		transList []string
-		noWarmup  bool
+		ipOverride string
+		count      int
+		gap        time.Duration
+		timeout    time.Duration
+		transList  []string
+		noWarmup   bool
 	)
 
 	root := &cobra.Command{
-		Use:     "dnsrtt",
+		Use:     "dnsrtt TARGET",
 		Version: version,
 		Short:   "Compare per-query latency of DNS transports against one resolver",
 		Long: "dnsrtt sends a fixed number of queries over each selected DNS\n" +
 			"transport (Do53, DoT, DoQ, DoH2, DoH3) to the same resolver and\n" +
 			"reports the latency distribution and connection re-dials.  Every\n" +
 			"transport is pinned to the same server IP, so the only variable is\n" +
-			"the transport itself.",
-		Args:          cobra.NoArgs,
+			"the transport itself.\n\n" +
+			"TARGET is a provider preset (" + presetNames() + "), a resolver\n" +
+			"hostname (its IP is resolved once and pinned), or a bare IP (only\n" +
+			"Do53 runs; the encrypted transports need a hostname).",
+		Args:          cobra.ExactArgs(1),
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			ip, err := netip.ParseAddr(resolver)
+		RunE: func(_ *cobra.Command, args []string) error {
+			host, ip, encrypted, err := resolveTarget(args[0], ipOverride)
 			if err != nil {
-				return fmt.Errorf("invalid --resolver %q: %w", resolver, err)
+				return err
 			}
 
-			targets, err := buildTargets(transList, hostname)
+			targets, skipped, err := buildTargets(transList, host, encrypted)
 			if err != nil {
 				return err
 			}
@@ -102,7 +138,7 @@ func main() {
 				Names:      defaultNames,
 			}
 
-			printHeader(cfg, hostname)
+			printHeader(cfg, host, skipped)
 			results := bench.Run(cfg, targets)
 			printReport(results)
 
@@ -111,8 +147,7 @@ func main() {
 	}
 
 	f := root.Flags()
-	f.StringVarP(&resolver, "resolver", "r", "9.9.9.10", "resolver IP every transport is pinned to")
-	f.StringVarP(&hostname, "hostname", "H", "dns10.quad9.net", "TLS server name for encrypted transports")
+	f.StringVar(&ipOverride, "ip", "", "pin the server IP for a hostname/preset target (e.g. a specific PoP)")
 	f.IntVarP(&count, "count", "n", 50, "timed queries per transport")
 	f.DurationVarP(&gap, "gap", "g", 0, "idle sleep between queries (e.g. 25s) to observe re-dials")
 	f.DurationVarP(&timeout, "timeout", "t", 5*time.Second, "per-query timeout")
@@ -126,27 +161,123 @@ func main() {
 	}
 }
 
-// buildTargets resolves the requested transport keys into targets.
-func buildTargets(keys []string, host string) (targets []bench.Target, err error) {
+// resolveTarget turns the TARGET argument into a (host, pinned IP) pair.  A
+// preset name yields both; a bare IP yields the IP as host with encrypted
+// false (only Do53 can run); a hostname is resolved to an IP unless ipOverride
+// pins one.
+func resolveTarget(target, ipOverride string) (host string, ip netip.Addr, encrypted bool, err error) {
+	if p, ok := lookupPreset(target); ok {
+		host = p.host
+		ip = netip.MustParseAddr(p.ip)
+	} else if addr, perr := netip.ParseAddr(target); perr == nil {
+		// Bare IP: no TLS name to present, so only Do53 can run.  Do53 targets
+		// the IP literal directly; encrypted transports are dropped downstream.
+		if err = overrideErr(ipOverride); err != nil {
+			return "", netip.Addr{}, false, err
+		}
+
+		return addr.String(), addr, false, nil
+	} else {
+		host = target
+	}
+
+	if ipOverride != "" {
+		ip, err = netip.ParseAddr(ipOverride)
+		if err != nil {
+			return "", netip.Addr{}, false, fmt.Errorf("invalid --ip %q: %w", ipOverride, err)
+		}
+	} else if !ip.IsValid() {
+		ip, err = resolveHost(host)
+		if err != nil {
+			return "", netip.Addr{}, false, err
+		}
+	}
+
+	return host, ip, true, nil
+}
+
+// overrideErr rejects --ip on a bare-IP target, where it would be meaningless.
+func overrideErr(ipOverride string) error {
+	if ipOverride != "" {
+		return fmt.Errorf("--ip cannot be combined with a bare IP target")
+	}
+
+	return nil
+}
+
+// lookupPreset returns the preset named by key, matched case-insensitively.
+func lookupPreset(key string) (preset, bool) {
+	key = strings.ToLower(strings.TrimSpace(key))
+	for _, p := range presets {
+		if p.name == key {
+			return p, true
+		}
+	}
+
+	return preset{}, false
+}
+
+// resolveHost looks up host once and returns one address, preferring IPv4 so
+// the pinned address matches the common path.
+func resolveHost(host string) (netip.Addr, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("resolving %q: %w", host, err)
+	}
+
+	for _, a := range addrs {
+		if a.Is4() {
+			return a, nil
+		}
+	}
+
+	return addrs[0].Unmap(), nil
+}
+
+// buildTargets resolves the requested transport keys into targets.  When the
+// target is a bare IP (encrypted is false), encrypted transports are dropped
+// and returned in skipped so the caller can note them.
+func buildTargets(keys []string, host string, encrypted bool) (targets []bench.Target, skipped []string, err error) {
 	targets = make([]bench.Target, 0, len(keys))
 	for _, k := range keys {
-		b, ok := transports[strings.ToLower(strings.TrimSpace(k))]
+		key := strings.ToLower(strings.TrimSpace(k))
+		b, ok := transports[key]
 		if !ok {
-			return nil, fmt.Errorf("unknown transport %q (have: do53,dot,doq,doh2,doh3)", k)
+			return nil, nil, fmt.Errorf("unknown transport %q (have: do53,dot,doq,doh2,doh3)", k)
+		}
+
+		if !encrypted && encryptedKeys[key] {
+			skipped = append(skipped, b(host).Name)
+
+			continue
 		}
 
 		targets = append(targets, b(host))
 	}
 
-	return targets, nil
+	if len(targets) == 0 {
+		return nil, nil, fmt.Errorf("no transports to run: a bare IP target supports only do53")
+	}
+
+	return targets, skipped, nil
 }
 
 // printHeader describes the run parameters.
-func printHeader(cfg bench.Config, host string) {
+func printHeader(cfg bench.Config, host string, skipped []string) {
 	fmt.Printf(
-		"resolver=%s host=%s count=%d gap=%s timeout=%s warmup=%t\n\n",
+		"resolver=%s host=%s count=%d gap=%s timeout=%s warmup=%t\n",
 		cfg.ResolverIP, host, cfg.Count, cfg.Gap, cfg.Timeout, cfg.Warmup,
 	)
+
+	if len(skipped) > 0 {
+		fmt.Printf("skipping %s: encrypted transports need a hostname, not a bare IP\n",
+			strings.Join(skipped, ", "))
+	}
+
+	fmt.Println()
 }
 
 // printReport prints a one-line summary per target.
@@ -156,8 +287,13 @@ func printReport(results []bench.Result) {
 
 	for _, r := range results {
 		s := r.Summarize()
-		if s.SetupErr != nil {
+		switch {
+		case s.SetupErr != nil:
 			fmt.Fprintf(w, "%s\tsetup error: %v\n", s.Name, s.SetupErr)
+
+			continue
+		case s.ProbeErr != nil:
+			fmt.Fprintf(w, "%s\tskipped: %v\n", s.Name, s.ProbeErr)
 
 			continue
 		}

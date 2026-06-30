@@ -45,14 +45,30 @@ go build -o dnsrtt .
 ## Usage
 
 ```
-dnsrtt [flags]
+dnsrtt TARGET [flags]
 ```
+
+`TARGET` is required and decides which resolver you measure. It can be one of
+three things:
+
+- a provider preset (`quad9`, `cloudflare`, `google`, `adguard`), which carries
+  a known hostname and a pinned anycast IP;
+- a resolver hostname (e.g. `dns.quad9.net`), whose IP is resolved once and then
+  pinned for every transport;
+- a bare IP (e.g. `9.9.9.9`), which runs Do53 only. The encrypted transports
+  need a hostname to present as the TLS server name, so they are skipped with a
+  note.
+
+The IP and the TLS name always come from the same target, so they cannot
+disagree. That matters because an encrypted upstream validates the server's
+certificate against the hostname: a mismatched pair fails the handshake. If you
+need to test a specific point of presence, pass `--ip` to pin the address a
+hostname or preset resolves to.
 
 Flags:
 
 ```
--r, --resolver string      resolver IP every transport is pinned to (default "9.9.9.10")
--H, --hostname string      TLS server name for encrypted transports (default "dns10.quad9.net")
+    --ip string            pin the server IP for a hostname/preset target (e.g. a specific PoP)
 -n, --count int            timed queries per transport (default 50)
 -g, --gap duration         idle sleep between queries (e.g. 25s) to observe re-dials
 -t, --timeout duration     per-query timeout (default 5s)
@@ -61,40 +77,56 @@ Flags:
 -v, --version              print version and exit
 ```
 
-The resolver IP is pinned separately from the hostname so that every encrypted
-transport reaches the same physical server while still presenting a valid TLS
-name. For Quad9 the defaults pair `9.9.9.10` with `dns10.quad9.net`; point both
-at another provider to test it instead.
+Not every provider offers every transport (Cloudflare and Google do not run
+DoQ, for example). A transport the server will not accept is skipped after its
+first query fails, so the run finishes in about one timeout instead of stalling
+on every query.
 
 ## Examples
 
-Warm, back-to-back run against the default Quad9 resolver:
+Warm, back-to-back run against the Quad9 preset:
 
 ```
-$ dnsrtt
-resolver=9.9.9.10 host=dns10.quad9.net count=50 gap=0s timeout=5s warmup=true
+$ dnsrtt quad9
+resolver=9.9.9.9 host=dns.quad9.net count=50 gap=0s timeout=5s warmup=true
 
 transport  n   avg     median  p95     min     max     redials  outliers
-Do53       50  14.3ms  13.6ms  23.1ms  11.1ms  25.6ms  0        1
-DoQ        50  13.0ms  12.0ms  18.2ms  9.9ms   18.9ms  0        0
-DoH3       50  12.6ms  12.4ms  17.1ms  10.2ms  18.8ms  0        0
+Do53       50  13.9ms  13.8ms  15.8ms  11.8ms  16.3ms  0        0
+DoQ        50  11.8ms  11.7ms  12.9ms  10.6ms  16.6ms  0        0
+DoH3       50  13.3ms  13.0ms  17.1ms  11.1ms  19.3ms  0        0
 ```
 
-With an idle gap larger than the client keep-alive (20s), the server drops the
-connection and the next query reconnects. DoQ pays a visible spike, DoH3 mostly
-does not:
+A bare IP measures only Do53 and says so:
 
 ```
-$ dnsrtt --transports do53,doq,doh3 --count 6 --gap 25s
-...
+$ dnsrtt 9.9.9.9 -n 8
+resolver=9.9.9.9 host=9.9.9.9 count=8 gap=0s timeout=5s warmup=true
+skipping DoQ, DoH3: encrypted transports need a hostname, not a bare IP
+
 transport  n  avg     median  p95     min     max     redials  outliers
-Do53       6  13.7ms  13.9ms  15.1ms  12.2ms  15.1ms  0        0
-DoQ        6  24.6ms  12.4ms  83.6ms  11.1ms  83.6ms  1        1
-DoH3       5  13.8ms  12.7ms  19.6ms  11.5ms  19.6ms  1        0
+Do53       8  15.2ms  14.9ms  17.9ms  13.9ms  17.9ms  0        0
 ```
 
-Numbers depend on your network path and on how aggressively the server recycles
-connections, so expect variation between runs.
+The `--gap` flag inserts an idle sleep between queries so you can watch for
+reconnects. Note that the QUIC clients run a 20s keep-alive that pings the
+connection, so a moderate gap usually keeps it alive and you see no redial:
+
+```
+$ dnsrtt quad9 -T do53,doq,doh3 -n 4 -g 25s
+resolver=9.9.9.9 host=dns.quad9.net count=4 gap=25s timeout=5s warmup=true
+
+transport  n  avg     median  p95     min     max     redials  outliers
+Do53       4  15.8ms  16.0ms  17.7ms  14.0ms  17.7ms  0        0
+DoQ        4  13.6ms  13.4ms  16.4ms  12.3ms  16.4ms  0        0
+DoH3       4  16.5ms  16.3ms  18.7ms  14.8ms  18.7ms  0        0
+```
+
+A redial shows up when the server itself drops the connection (a long idle
+period, or a server that recycles connections under load). When that happens
+the `redials` column ticks up and the reconnecting query lands as an outlier,
+and DoQ's reconnect tends to cost more than DoH3's. Numbers depend on your
+network path and on how aggressively the server recycles connections, so expect
+variation between runs.
 
 ## Columns
 
