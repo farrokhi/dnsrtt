@@ -4,6 +4,7 @@ version: 2
 before:
   hooks:
     - go mod tidy
+    - sh scripts/gen-third-party-notices.sh
 
 builds:
   - env:
@@ -22,6 +23,7 @@ archives:
     files:
       - README.md
       - LICENSE
+      - THIRD-PARTY-NOTICES
 
 checksum:
   name_template: "checksums.txt"
