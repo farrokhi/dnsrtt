@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"runtime/debug"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -18,8 +19,22 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// version is the released version of dnsrtt.
-const version = "1.1.0"
+// version is set at release time via -ldflags "-X main.version=...".
+var version = ""
+
+// versionString prefers the release-injected version, then the module version
+// Go stamps into binaries built with `go install module@vX.Y.Z`, then "dev".
+func versionString() string {
+	if version != "" {
+		return version
+	}
+
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+
+	return "dev"
+}
 
 // defaultNames is a small rotating set of popular, cacheable domains.  Keeping
 // them cached server-side strips recursion variance and leaves mostly transport
@@ -105,7 +120,7 @@ func main() {
 
 	root := &cobra.Command{
 		Use:     "dnsrtt TARGET",
-		Version: version,
+		Version: versionString(),
 		Short:   "Compare per-query latency of DNS transports against one resolver",
 		Long: "dnsrtt sends a fixed number of queries over each selected DNS\n" +
 			"transport (Do53, DoT, DoQ, DoH2, DoH3) to the same resolver and\n" +

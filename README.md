@@ -32,6 +32,10 @@ other encrypted transport protocols.
 
 ## Install
 
+Prebuilt binaries for Linux, macOS, FreeBSD and Windows (amd64 and arm64) are
+on the [releases page](https://github.com/farrokhi/dnsrtt/releases). Or install
+with the Go toolchain:
+
 ```
 go install github.com/farrokhi/dnsrtt@latest
 ```
