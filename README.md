@@ -1,17 +1,38 @@
 # dnsrtt
 
+[![CI](https://github.com/farrokhi/dnsrtt/actions/workflows/ci.yml/badge.svg)](https://github.com/farrokhi/dnsrtt/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/farrokhi/dnsrtt)](https://github.com/farrokhi/dnsrtt/releases)
+[![Go version](https://img.shields.io/github/go-mod/go-version/farrokhi/dnsrtt)](go.mod)
+[![License](https://img.shields.io/github/license/farrokhi/dnsrtt)](LICENSE)
+
+## TL;DR
+
+```
+go install github.com/farrokhi/dnsrtt@latest
+dnsrtt quad9
+```
+
+That sends 50 queries each over plain DNS, DNS-over-QUIC and DNS-over-HTTPS/3
+to the same Quad9 server and prints a latency table per transport. The point is
+to see what an encrypted transport costs you compared to plain DNS. Prebuilt
+binaries are on the
+[releases page](https://github.com/farrokhi/dnsrtt/releases) if you would
+rather not build anything.
+
+## What it does
+
 `dnsrtt` is a small benchmark that compares the per-query latency of different
 DNS transports against the same resolver. It sends a fixed number of queries
 over each selected transport (Do53, DoT, DoQ, DoH2, DoH3) and reports the
 latency distribution along with how many times the underlying connection had to
 be re-established.
 
-Every transport is pinned to the same server IP through a static
-bootstrap, therefore the only thing that changes between rows is the
-transport on the wire. This tool uses
-[AdGuardTeam/dnsproxy](https://github.com/AdguardTeam/dnsproxy)
-, which means there is no resolver selection or load balancing
- between the measurement and the network.
+Every transport is pinned to the same server IP through a static bootstrap, so
+the only thing that changes between rows is the transport on the wire. The
+upstream clients come from
+[AdGuardTeam/dnsproxy](https://github.com/AdguardTeam/dnsproxy), driven
+directly, with no resolver selection or load balancing between the measurement
+and the network.
 
 ## Why this tool exists
 
@@ -24,11 +45,10 @@ client opened a new QUIC connection, with a full TLS handshake, on every query.
 
 When the connection is warm, the transports are more or less equal
 (unless you are a nitpicker). The additional latency in the dashboard
-average comes from connection re-establishment, which is encrypted
-protocol is very expensive.
-DoQ reconnect tends to be extra expensive compared to DoH3 which sends
-its query as QUIC 0-RTT early data and so the startup cost is lower than
-other encrypted transport protocols. 
+average comes from connection re-establishment, which is expensive for
+encrypted protocols. DoQ reconnects tend to be extra costly compared to
+DoH3, which sends its query as QUIC 0-RTT early data, so its startup
+cost is lower than the other encrypted transports.
 
 ## Install
 
@@ -141,4 +161,6 @@ transport-agnostic proxy for reconnect cost.
 
 ## License
 
-BSD-2-Clause. See [LICENSE](LICENSE).
+BSD-2-Clause. See [LICENSE](LICENSE). Release archives also carry a
+`THIRD-PARTY-NOTICES` file with the licenses of the Go modules linked into the
+binary (all permissive: Apache-2.0, BSD, MIT, and Unlicense).
