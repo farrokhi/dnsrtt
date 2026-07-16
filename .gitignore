@@ -12,6 +12,7 @@ go.work.sum
 
 # goreleaser
 /dist/
+/THIRD-PARTY-NOTICES
 
 # Editor / OS
 .DS_Store
