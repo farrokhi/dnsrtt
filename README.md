@@ -98,7 +98,7 @@ Flags:
 -n, --count int            timed queries per transport (default 50)
 -g, --gap duration         idle sleep between queries (e.g. 25s) to observe re-dials
 -t, --timeout duration     per-query timeout (default: measured from path RTT)
-    --mtu int              path MTU for QUIC packet sizing (default: measured from egress interface)
+    --mtu int              pin the path MTU for QUIC packet sizing (default: RFC 1200-byte floor, grown by PMTUD)
 -T, --transports strings   transports to test: do53,dot,doq,doh2,doh3 (default do53,doq,doh3)
     --no-warmup            do not send an untimed warm-up query first
 -v, --version              print version and exit
@@ -112,8 +112,8 @@ on every query.
 ## Timeouts and MTU
 
 The QUIC transports fail in two ways a fixed configuration cannot handle, so
-dnsrtt measures the path first and tunes to it, printing the RTT and MTU it
-found in the header.
+dnsrtt measures the path first and tunes to it. The header prints the RTT and
+the QUIC initial packet size it used.
 
 Latency: an encrypted handshake costs two to three round trips before the
 query, and DoH3 must fit all of it in one deadline, so a timeout that suits a
@@ -121,12 +121,14 @@ fast link fails on a slow one and looks like a dead transport. dnsrtt sizes the
 per-query budget at six times the measured RTT (floor 5s, ceiling 60s); `-t`
 overrides it.
 
-Packet size: quic-go sends 1280-byte initial packets, which become 1308-byte IP
-packets that do not fit a 1280-MTU tunnel or VPN, and the drop is often
-invisible because the ICMP is filtered. This is why DoQ and DoH3 silently time
-out on many VPNs while plain DNS still works. dnsrtt sizes the initial packet to
-the egress MTU (`--mtu` overrides), and skips QUIC with the measured numbers
-when the path is below QUIC's 1200-byte floor.
+Packet size: quic-go's default 1280-byte initial packets become 1308-byte IP
+packets that do not fit a tunnel or VPN whose path MTU is smaller, and the drop
+is often invisible because the ICMP is filtered. This is why DoQ and DoH3
+silently time out on many VPNs while plain DNS still works. dnsrtt sends its
+initial packets at QUIC's mandatory 1200-byte floor, which every QUIC-capable
+path must carry, and lets quic-go's path MTU discovery grow them afterward.
+`--mtu` pins a larger size for a path known to allow it, and QUIC is skipped
+when `--mtu` is below the 1200-byte floor.
 
 ## Examples
 
@@ -134,7 +136,7 @@ Warm, back-to-back run against the Quad9 preset:
 
 ```
 $ dnsrtt quad9
-resolver=9.9.9.9 host=dns.quad9.net rtt=171.9ms mtu=1280 count=50 gap=0s timeout=5s (auto via tcp/443) warmup=true
+resolver=9.9.9.9 host=dns.quad9.net rtt=171.9ms quicpkt=1200B count=50 gap=0s timeout=5s (auto via tcp/443) warmup=true
 
 transport  n   avg      median   p95      min      max      redials  outliers
 Do53       50  176.3ms  176.0ms  180.1ms  172.1ms  186.3ms  0        0
@@ -146,12 +148,26 @@ A bare IP measures only Do53 and says so:
 
 ```
 $ dnsrtt 9.9.9.9 -n 8
-resolver=9.9.9.9 host=9.9.9.9 rtt=173.4ms mtu=1280 count=8 gap=0s timeout=5s (auto via tcp/443) warmup=true
+resolver=9.9.9.9 host=9.9.9.9 rtt=173.4ms quicpkt=1200B count=8 gap=0s timeout=5s (auto via tcp/443) warmup=true
 skipping DoQ: needs a hostname, not a bare IP
 skipping DoH3: needs a hostname, not a bare IP
 
 transport  n  avg      median   p95      min      max      redials  outliers
 Do53       8  176.2ms  175.4ms  179.0ms  174.3ms  179.0ms  0        0
+```
+
+A transport the server does not answer is marked unavailable. A bare timeout
+cannot tell "not offered" from "port blocked on your path", so the note says so
+rather than guessing (Cloudflare does not run DoQ):
+
+```
+$ dnsrtt cloudflare -n 5
+resolver=1.1.1.1 host=cloudflare-dns.com rtt=170.7ms quicpkt=1200B count=5 gap=0s timeout=5s (auto via tcp/443) warmup=true
+
+transport  n  avg      median   p95      min      max      redials  outliers
+Do53       5  178.4ms  178.1ms  184.4ms  173.3ms  184.4ms  0        0
+DoQ        unavailable: no response on udp/853 (server may not offer DoQ, or the port is blocked)
+DoH3       5  173.8ms  174.0ms  175.4ms  172.6ms  175.4ms  0        0
 ```
 
 The `--gap` flag inserts an idle sleep between queries so you can watch for
@@ -160,7 +176,7 @@ connection, so a moderate gap usually keeps it alive and you see no redial:
 
 ```
 $ dnsrtt quad9 -T do53,doq,doh3 -n 4 -g 25s
-resolver=9.9.9.9 host=dns.quad9.net rtt=167.1ms mtu=1280 count=4 gap=25s timeout=5s (auto via tcp/443) warmup=true
+resolver=9.9.9.9 host=dns.quad9.net rtt=167.1ms quicpkt=1200B count=4 gap=25s timeout=5s (auto via tcp/443) warmup=true
 
 transport  n  avg      median   p95      min      max      redials  outliers
 Do53       4  173.5ms  172.9ms  176.6ms  172.0ms  176.6ms  0        0

@@ -29,23 +29,12 @@ type Path struct {
 
 	// RTTOK reports whether any probe in the chain succeeded.
 	RTTOK bool
-
-	// MTU is the link MTU of the egress interface.  Only meaningful when MTUOK.
-	MTU int
-
-	// MTUOK reports whether the MTU could be determined.
-	MTUOK bool
 }
 
-// Measure characterizes the path to ip: how far away it is and how large a
-// packet it can carry.
+// Measure characterizes the path to ip, currently its round-trip time.
 func Measure(ip netip.Addr) (p Path) {
 	if rtt, method, ok := baseline(ip); ok {
 		p.RTT, p.Method, p.RTTOK = rtt, method, true
-	}
-
-	if mtu, err := MTU(ip); err == nil {
-		p.MTU, p.MTUOK = mtu, true
 	}
 
 	return p
