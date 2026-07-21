@@ -28,11 +28,13 @@ latency distribution along with how many times the underlying connection had to
 be re-established.
 
 Every transport is pinned to the same server IP through a static bootstrap, so
-the only thing that changes between rows is the transport on the wire. The
-upstream clients come from
-[AdGuardTeam/dnsproxy](https://github.com/AdguardTeam/dnsproxy), driven
-directly, with no resolver selection or load balancing between the measurement
-and the network.
+the only thing that changes between rows is the transport on the wire. Do53,
+DoT and DoH2 use [AdGuardTeam/dnsproxy](https://github.com/AdguardTeam/dnsproxy)
+directly. DoQ and DoH3 use native [quic-go](https://github.com/quic-go/quic-go)
+clients so the QUIC packet size and handshake timeout can be tuned to the path
+(see [Timeouts and MTU](#timeouts-and-mtu)); dnsproxy does not expose those. In
+all cases there is no resolver selection or load balancing between the
+measurement and the network.
 
 ## Why this tool exists
 
@@ -95,7 +97,8 @@ Flags:
     --ip string            pin the server IP for a hostname/preset target (e.g. a specific PoP)
 -n, --count int            timed queries per transport (default 50)
 -g, --gap duration         idle sleep between queries (e.g. 25s) to observe re-dials
--t, --timeout duration     per-query timeout (default 5s)
+-t, --timeout duration     per-query timeout (default: measured from path RTT)
+    --mtu int              path MTU for QUIC packet sizing (default: measured from egress interface)
 -T, --transports strings   transports to test: do53,dot,doq,doh2,doh3 (default do53,doq,doh3)
     --no-warmup            do not send an untimed warm-up query first
 -v, --version              print version and exit
@@ -106,29 +109,49 @@ DoQ, for example). A transport the server will not accept is skipped after its
 first query fails, so the run finishes in about one timeout instead of stalling
 on every query.
 
+## Timeouts and MTU
+
+The QUIC transports fail in two ways a fixed configuration cannot handle, so
+dnsrtt measures the path first and tunes to it, printing the RTT and MTU it
+found in the header.
+
+Latency: an encrypted handshake costs two to three round trips before the
+query, and DoH3 must fit all of it in one deadline, so a timeout that suits a
+fast link fails on a slow one and looks like a dead transport. dnsrtt sizes the
+per-query budget at six times the measured RTT (floor 5s, ceiling 60s); `-t`
+overrides it.
+
+Packet size: quic-go sends 1280-byte initial packets, which become 1308-byte IP
+packets that do not fit a 1280-MTU tunnel or VPN, and the drop is often
+invisible because the ICMP is filtered. This is why DoQ and DoH3 silently time
+out on many VPNs while plain DNS still works. dnsrtt sizes the initial packet to
+the egress MTU (`--mtu` overrides), and skips QUIC with the measured numbers
+when the path is below QUIC's 1200-byte floor.
+
 ## Examples
 
 Warm, back-to-back run against the Quad9 preset:
 
 ```
 $ dnsrtt quad9
-resolver=9.9.9.9 host=dns.quad9.net count=50 gap=0s timeout=5s warmup=true
+resolver=9.9.9.9 host=dns.quad9.net rtt=171.9ms mtu=1280 count=50 gap=0s timeout=5s (auto via tcp/443) warmup=true
 
-transport  n   avg     median  p95     min     max     redials  outliers
-Do53       50  13.9ms  13.8ms  15.8ms  11.8ms  16.3ms  0        0
-DoQ        50  11.8ms  11.7ms  12.9ms  10.6ms  16.6ms  0        0
-DoH3       50  13.3ms  13.0ms  17.1ms  11.1ms  19.3ms  0        0
+transport  n   avg      median   p95      min      max      redials  outliers
+Do53       50  176.3ms  176.0ms  180.1ms  172.1ms  186.3ms  0        0
+DoQ        50  174.7ms  174.7ms  176.9ms  172.8ms  178.3ms  0        0
+DoH3       50  175.5ms  175.2ms  178.1ms  173.2ms  180.9ms  0        0
 ```
 
 A bare IP measures only Do53 and says so:
 
 ```
 $ dnsrtt 9.9.9.9 -n 8
-resolver=9.9.9.9 host=9.9.9.9 count=8 gap=0s timeout=5s warmup=true
-skipping DoQ, DoH3: encrypted transports need a hostname, not a bare IP
+resolver=9.9.9.9 host=9.9.9.9 rtt=173.4ms mtu=1280 count=8 gap=0s timeout=5s (auto via tcp/443) warmup=true
+skipping DoQ: needs a hostname, not a bare IP
+skipping DoH3: needs a hostname, not a bare IP
 
-transport  n  avg     median  p95     min     max     redials  outliers
-Do53       8  15.2ms  14.9ms  17.9ms  13.9ms  17.9ms  0        0
+transport  n  avg      median   p95      min      max      redials  outliers
+Do53       8  176.2ms  175.4ms  179.0ms  174.3ms  179.0ms  0        0
 ```
 
 The `--gap` flag inserts an idle sleep between queries so you can watch for
@@ -137,12 +160,12 @@ connection, so a moderate gap usually keeps it alive and you see no redial:
 
 ```
 $ dnsrtt quad9 -T do53,doq,doh3 -n 4 -g 25s
-resolver=9.9.9.9 host=dns.quad9.net count=4 gap=25s timeout=5s warmup=true
+resolver=9.9.9.9 host=dns.quad9.net rtt=167.1ms mtu=1280 count=4 gap=25s timeout=5s (auto via tcp/443) warmup=true
 
-transport  n  avg     median  p95     min     max     redials  outliers
-Do53       4  15.8ms  16.0ms  17.7ms  14.0ms  17.7ms  0        0
-DoQ        4  13.6ms  13.4ms  16.4ms  12.3ms  16.4ms  0        0
-DoH3       4  16.5ms  16.3ms  18.7ms  14.8ms  18.7ms  0        0
+transport  n  avg      median   p95      min      max      redials  outliers
+Do53       4  173.5ms  172.9ms  176.6ms  172.0ms  176.6ms  0        0
+DoQ        4  168.8ms  169.5ms  169.7ms  167.7ms  169.7ms  0        0
+DoH3       4  172.7ms  173.9ms  179.4ms  167.3ms  179.4ms  0        0
 ```
 
 A redial shows up when the server itself drops the connection (a long idle
@@ -155,9 +178,9 @@ variation between runs.
 ## Columns
 
 `avg`, `median`, `p95`, `min`, `max` summarize the successful query latencies.
-`redials` counts connection re-establishments seen in the dnsproxy debug log
-after the first connection. `outliers` counts samples above 1.8x the median, a
-transport-agnostic proxy for reconnect cost.
+`redials` counts connection re-establishments after the first connection.
+`outliers` counts samples above 1.8x the median, a transport-agnostic proxy for
+reconnect cost.
 
 ## License
 
