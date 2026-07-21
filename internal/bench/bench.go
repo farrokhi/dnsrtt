@@ -1,15 +1,10 @@
 // Package bench measures and compares per-query latency of different DNS
-// transports (Do53, DoT, DoQ, DoH2, DoH3) against the same resolver.  It drives
-// AdGuardTeam's dnsproxy upstream package directly, so there is no resolver
-// selection or load balancing between the caller and the wire.
+// transports against one resolver.  It is transport-agnostic: each target
+// supplies an [upstream.Upstream], so the same loop times a dnsproxy client and
+// a native quic-go client identically.
 package bench
 
 import (
-	"bytes"
-	"fmt"
-	"log/slog"
-	"net/netip"
-	"strings"
 	"time"
 
 	"github.com/AdguardTeam/dnsproxy/upstream"
@@ -21,20 +16,19 @@ type Target struct {
 	// Name is the short label shown in the report, e.g. "DoQ".
 	Name string
 
-	// Addr is the dnsproxy upstream address, e.g. "quic://dns10.quad9.net:853".
-	Addr string
+	// Open builds the upstream to measure.  A target owns its own transport,
+	// timeout and connection, so the loop only has to time [upstream.Exchange].
+	Open func() (upstream.Upstream, error)
+}
 
-	// HTTPVersions optionally pins the allowed HTTP versions for DoH targets so
-	// that, for example, DoH3 cannot silently fall back to HTTP/2.
-	HTTPVersions []upstream.HTTPVersion
+// RedialCounter is implemented by upstreams that can report how many times they
+// re-established their connection during a run.
+type RedialCounter interface {
+	Redials() int
 }
 
 // Config holds the parameters shared by every target in a run.
 type Config struct {
-	// ResolverIP is the concrete server address every transport is pinned to via
-	// a static bootstrap, so the only variable between targets is the transport.
-	ResolverIP netip.Addr
-
 	// Count is the number of timed queries sent per target.
 	Count int
 
@@ -42,9 +36,6 @@ type Config struct {
 	// gap is used to observe whether a transport re-dials its connection after
 	// sitting idle.
 	Gap time.Duration
-
-	// Timeout is the per-query upstream timeout.
-	Timeout time.Duration
 
 	// Warmup, when true, sends one untimed query first so the initial handshake
 	// is not counted in the samples.
@@ -67,8 +58,7 @@ type Result struct {
 	// Errors is the number of failed queries.
 	Errors int
 
-	// Redials is the number of connection re-establishments observed in the
-	// dnsproxy debug log after the initial connection.
+	// Redials is the number of connection re-establishments after the first.
 	Redials int
 
 	// SetupErr is set when the target could not be constructed at all.
@@ -92,25 +82,13 @@ func Run(cfg Config, targets []Target) (results []Result) {
 	return results
 }
 
-// runTarget builds the upstream for t and sends cfg.Count timed queries.
+// runTarget opens the upstream for t and sends cfg.Count timed queries.
 func runTarget(cfg Config, t Target) (res Result) {
 	res.Name = t.Name
 
-	var logBuf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	}))
-
-	opts := &upstream.Options{
-		Logger:       logger,
-		Timeout:      cfg.Timeout,
-		Bootstrap:    upstream.StaticResolver{cfg.ResolverIP},
-		HTTPVersions: t.HTTPVersions,
-	}
-
-	u, err := upstream.AddressToUpstream(t.Addr, opts)
+	u, err := t.Open()
 	if err != nil {
-		res.SetupErr = fmt.Errorf("creating upstream: %w", err)
+		res.SetupErr = err
 
 		return res
 	}
@@ -156,7 +134,9 @@ func runTarget(cfg Config, t Target) (res Result) {
 		res.Durations = append(res.Durations, elapsed)
 	}
 
-	res.Redials = countRedials(logBuf.String())
+	if rc, ok := u.(RedialCounter); ok {
+		res.Redials = rc.Redials()
+	}
 
 	return res
 }
@@ -168,20 +148,4 @@ func newReq(name string) (req *dns.Msg) {
 	req.RecursionDesired = true
 
 	return req
-}
-
-// redialMarkers are the dnsproxy debug log lines that mark a new connection
-// being established after the first one.
-var redialMarkers = []string{
-	"recreating the quic connection", // DoQ re-dial, see dnsproxy upstream/doq.go
-	"recreating the http client",     // DoH re-dial, see dnsproxy upstream/doh.go
-}
-
-// countRedials tallies re-dial markers in the captured debug log.
-func countRedials(log string) (n int) {
-	for _, m := range redialMarkers {
-		n += strings.Count(log, m)
-	}
-
-	return n
 }

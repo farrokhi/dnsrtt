@@ -5,6 +5,7 @@ go 1.26.5
 require (
 	github.com/AdguardTeam/dnsproxy v0.83.0
 	github.com/miekg/dns v1.1.72
+	github.com/quic-go/quic-go v0.60.0
 	github.com/spf13/cobra v1.10.2
 )
 
@@ -14,7 +15,6 @@ require (
 	github.com/ameshkov/dnsstamps v1.0.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.60.0 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	golang.org/x/crypto v0.54.0 // indirect

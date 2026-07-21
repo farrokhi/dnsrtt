@@ -1,6 +1,7 @@
 // Command dnsrtt compares the per-query latency of different DNS transports
 // (Do53, DoT, DoQ, DoH2, DoH3) against the same resolver, so the only variable
-// is the transport on the wire.
+// is the transport on the wire.  The QUIC transports use native quic-go clients
+// tuned to the path (packet size, handshake timeout); the rest use dnsproxy.
 package main
 
 import (
@@ -16,6 +17,8 @@ import (
 
 	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/farrokhi/dnsrtt/internal/bench"
+	"github.com/farrokhi/dnsrtt/internal/probe"
+	"github.com/farrokhi/dnsrtt/internal/transport"
 	"github.com/spf13/cobra"
 )
 
@@ -36,6 +39,10 @@ func versionString() string {
 	return "dev"
 }
 
+// lookupTimeout bounds the hostname lookup, which happens before the path can
+// be measured and so cannot use the probed budget.
+const lookupTimeout = 15 * time.Second
+
 // defaultNames is a small rotating set of popular, cacheable domains.  Keeping
 // them cached server-side strips recursion variance and leaves mostly transport
 // round-trip time.
@@ -54,8 +61,7 @@ type preset struct {
 	ip   string
 }
 
-// presets are the built-in providers, quad9 first.  buildTargets and the help
-// text iterate this slice so the order is stable.
+// presets are the built-in providers, quad9 first.
 var presets = []preset{
 	{"quad9", "dns.quad9.net", "9.9.9.9"},
 	{"cloudflare", "cloudflare-dns.com", "1.1.1.1"},
@@ -73,40 +79,59 @@ func presetNames() string {
 	return strings.Join(names, ", ")
 }
 
-// transportBuilder turns a TLS hostname into a target.  The resolver IP is
-// pinned separately via the bootstrap, so every transport hits the same server.
-type transportBuilder func(host string) bench.Target
-
-// transports maps a CLI key to the target it builds.
-var transports = map[string]transportBuilder{
-	"do53": func(host string) bench.Target {
-		return bench.Target{Name: "Do53", Addr: host + ":53"}
-	},
-	"dot": func(host string) bench.Target {
-		return bench.Target{Name: "DoT", Addr: "tls://" + host + ":853"}
-	},
-	"doq": func(host string) bench.Target {
-		return bench.Target{Name: "DoQ", Addr: "quic://" + host + ":853"}
-	},
-	"doh2": func(host string) bench.Target {
-		return bench.Target{
-			Name:         "DoH2",
-			Addr:         "https://" + host + ":443/dns-query",
-			HTTPVersions: []upstream.HTTPVersion{upstream.HTTPVersion2},
-		}
-	},
-	"doh3": func(host string) bench.Target {
-		return bench.Target{
-			Name:         "DoH3",
-			Addr:         "https://" + host + ":443/dns-query",
-			HTTPVersions: []upstream.HTTPVersion{upstream.HTTPVersion3},
-		}
-	},
+// target carries everything a transport needs to build its upstream.
+type target struct {
+	host       string
+	ip         netip.Addr
+	timeout    time.Duration
+	packetSize int
 }
 
-// encryptedKeys are the transport keys that need a TLS hostname and so cannot
-// run against a bare IP target.
-var encryptedKeys = map[string]bool{"dot": true, "doq": true, "doh2": true, "doh3": true}
+// spec describes one transport: how it is built and what it requires.
+type spec struct {
+	label     string
+	encrypted bool // needs a TLS hostname, so cannot run against a bare IP
+	quic      bool // rides QUIC, so needs a viable path MTU
+	open      func(target) (upstream.Upstream, error)
+}
+
+// transports maps a CLI key to its spec.  The QUIC transports use native
+// quic-go clients so their packet size and handshake timeout follow the path;
+// the rest use dnsproxy, where TCP handles MTU on its own.
+var transports = map[string]spec{
+	"do53": {label: "Do53", open: func(t target) (upstream.Upstream, error) {
+		return openDNSProxy(t.host+":53", t.ip, t.timeout, nil)
+	}},
+	"dot": {label: "DoT", encrypted: true, open: func(t target) (upstream.Upstream, error) {
+		return openDNSProxy("tls://"+t.host+":853", t.ip, t.timeout, nil)
+	}},
+	"doh2": {label: "DoH2", encrypted: true, open: func(t target) (upstream.Upstream, error) {
+		return openDNSProxy("https://"+t.host+":443/dns-query", t.ip, t.timeout,
+			[]upstream.HTTPVersion{upstream.HTTPVersion2})
+	}},
+	"doq": {label: "DoQ", encrypted: true, quic: true, open: func(t target) (upstream.Upstream, error) {
+		return transport.NewDoQ(quicConfig(t, 853)), nil
+	}},
+	"doh3": {label: "DoH3", encrypted: true, quic: true, open: func(t target) (upstream.Upstream, error) {
+		return transport.NewDoH3(quicConfig(t, 443)), nil
+	}},
+}
+
+// quicConfig builds the native transport config for a QUIC target on port.
+func quicConfig(t target, port uint16) transport.Config {
+	return transport.Config{
+		Addr:       netip.AddrPortFrom(t.ip, port),
+		ServerName: t.host,
+		Timeout:    t.timeout,
+		PacketSize: t.packetSize,
+	}
+}
+
+// skip records a transport that was not run and why.
+type skip struct {
+	name   string
+	reason string
+}
 
 func main() {
 	var (
@@ -114,6 +139,7 @@ func main() {
 		count      int
 		gap        time.Duration
 		timeout    time.Duration
+		mtu        int
 		transList  []string
 		noWarmup   bool
 	)
@@ -133,29 +159,43 @@ func main() {
 		Args:          cobra.ExactArgs(1),
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		RunE: func(_ *cobra.Command, args []string) error {
-			host, ip, encrypted, err := resolveTarget(args[0], ipOverride)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			host, ip, encrypted, err := resolveTarget(args[0], ipOverride, timeout)
 			if err != nil {
 				return err
 			}
 
-			targets, skipped, err := buildTargets(transList, host, encrypted)
-			if err != nil {
-				return err
+			path := probe.Measure(ip)
+
+			// Sizing the budget to the path keeps a consistently slow link from
+			// looking like a dead transport.  An explicit -t wins.
+			if !cmd.Flags().Changed("timeout") && path.RTTOK {
+				timeout = probe.Budget(path.RTT)
+			}
+
+			// The initial QUIC packet must fit the path MTU or the handshake is
+			// a black hole; a user --mtu overrides what was measured.
+			effMTU := path.MTU
+			if cmd.Flags().Changed("mtu") {
+				effMTU = mtu
+			}
+			packetSize, quicOK := quicSizing(effMTU, ip)
+
+			t := target{host: host, ip: ip, timeout: timeout, packetSize: packetSize}
+			targets, skips := buildTargets(transList, t, encrypted, quicOK, effMTU)
+			if len(targets) == 0 {
+				return fmt.Errorf("no transports to run")
 			}
 
 			cfg := bench.Config{
-				ResolverIP: ip,
-				Count:      count,
-				Gap:        gap,
-				Timeout:    timeout,
-				Warmup:     !noWarmup,
-				Names:      defaultNames,
+				Count:  count,
+				Gap:    gap,
+				Warmup: !noWarmup,
+				Names:  defaultNames,
 			}
 
-			printHeader(cfg, host, skipped)
-			results := bench.Run(cfg, targets)
-			printReport(results)
+			printHeader(cfg, host, ip, timeout, path, effMTU, cmd.Flags().Changed("timeout"), skips)
+			printReport(bench.Run(cfg, targets))
 
 			return nil
 		},
@@ -165,7 +205,9 @@ func main() {
 	f.StringVar(&ipOverride, "ip", "", "pin the server IP for a hostname/preset target (e.g. a specific PoP)")
 	f.IntVarP(&count, "count", "n", 50, "timed queries per transport")
 	f.DurationVarP(&gap, "gap", "g", 0, "idle sleep between queries (e.g. 25s) to observe re-dials")
-	f.DurationVarP(&timeout, "timeout", "t", 5*time.Second, "per-query timeout")
+	f.DurationVarP(&timeout, "timeout", "t", probe.DefaultBudget,
+		"per-query timeout (default: measured from path RTT)")
+	f.IntVar(&mtu, "mtu", 0, "path MTU for QUIC packet sizing (default: measured from egress interface)")
 	f.StringSliceVarP(&transList, "transports", "T", []string{"do53", "doq", "doh3"},
 		"transports to test: do53,dot,doq,doh2,doh3")
 	f.BoolVar(&noWarmup, "no-warmup", false, "do not send an untimed warm-up query first")
@@ -176,11 +218,21 @@ func main() {
 	}
 }
 
+// quicSizing turns an effective MTU into a QUIC packet size.  A zero or unknown
+// MTU falls back to the protocol minimum, which is safe on any path.
+func quicSizing(mtu int, ip netip.Addr) (size int, ok bool) {
+	if mtu <= 0 {
+		return probe.MinDatagram, true
+	}
+
+	return probe.PacketSize(mtu, ip)
+}
+
 // resolveTarget turns the TARGET argument into a (host, pinned IP) pair.  A
 // preset name yields both; a bare IP yields the IP as host with encrypted
 // false (only Do53 can run); a hostname is resolved to an IP unless ipOverride
 // pins one.
-func resolveTarget(target, ipOverride string) (host string, ip netip.Addr, encrypted bool, err error) {
+func resolveTarget(target, ipOverride string, timeout time.Duration) (host string, ip netip.Addr, encrypted bool, err error) {
 	if p, ok := lookupPreset(target); ok {
 		host = p.host
 		ip = netip.MustParseAddr(p.ip)
@@ -202,7 +254,7 @@ func resolveTarget(target, ipOverride string) (host string, ip netip.Addr, encry
 			return "", netip.Addr{}, false, fmt.Errorf("invalid --ip %q: %w", ipOverride, err)
 		}
 	} else if !ip.IsValid() {
-		ip, err = resolveHost(host)
+		ip, err = resolveHost(host, timeout)
 		if err != nil {
 			return "", netip.Addr{}, false, err
 		}
@@ -234,8 +286,13 @@ func lookupPreset(key string) (preset, bool) {
 
 // resolveHost looks up host once and returns one address, preferring IPv4 so
 // the pinned address matches the common path.
-func resolveHost(host string) (netip.Addr, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func resolveHost(host string, timeout time.Duration) (netip.Addr, error) {
+	deadline := lookupTimeout
+	if timeout > deadline {
+		deadline = timeout
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
 	defer cancel()
 
 	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
@@ -252,44 +309,72 @@ func resolveHost(host string) (netip.Addr, error) {
 	return addrs[0].Unmap(), nil
 }
 
-// buildTargets resolves the requested transport keys into targets.  When the
-// target is a bare IP (encrypted is false), encrypted transports are dropped
-// and returned in skipped so the caller can note them.
-func buildTargets(keys []string, host string, encrypted bool) (targets []bench.Target, skipped []string, err error) {
-	targets = make([]bench.Target, 0, len(keys))
+// buildTargets resolves the requested transport keys into targets, skipping the
+// encrypted ones on a bare IP and the QUIC ones when the path MTU cannot carry
+// QUIC.  Requested order is preserved.
+func buildTargets(keys []string, t target, encrypted, quicOK bool, mtu int) (targets []bench.Target, skips []skip) {
 	for _, k := range keys {
 		key := strings.ToLower(strings.TrimSpace(k))
-		b, ok := transports[key]
+		s, ok := transports[key]
 		if !ok {
-			return nil, nil, fmt.Errorf("unknown transport %q (have: do53,dot,doq,doh2,doh3)", k)
-		}
-
-		if !encrypted && encryptedKeys[key] {
-			skipped = append(skipped, b(host).Name)
+			skips = append(skips, skip{key, "unknown transport"})
 
 			continue
 		}
 
-		targets = append(targets, b(host))
+		switch {
+		case s.encrypted && !encrypted:
+			skips = append(skips, skip{s.label, "needs a hostname, not a bare IP"})
+		case s.quic && !quicOK:
+			skips = append(skips, skip{s.label, quicSkipReason(mtu, t.ip)})
+		default:
+			s := s
+			targets = append(targets, bench.Target{
+				Name: s.label,
+				Open: func() (upstream.Upstream, error) { return s.open(t) },
+			})
+		}
 	}
 
-	if len(targets) == 0 {
-		return nil, nil, fmt.Errorf("no transports to run: a bare IP target supports only do53")
-	}
+	return targets, skips
+}
 
-	return targets, skipped, nil
+// quicSkipReason explains why a QUIC transport cannot run on this path.
+func quicSkipReason(mtu int, ip netip.Addr) string {
+	return fmt.Sprintf("path MTU %d carries %dB < %dB QUIC minimum",
+		mtu, mtu-probe.Overhead(ip), probe.MinDatagram)
 }
 
 // printHeader describes the run parameters.
-func printHeader(cfg bench.Config, host string, skipped []string) {
+func printHeader(
+	cfg bench.Config,
+	host string,
+	ip netip.Addr,
+	timeout time.Duration,
+	path probe.Path,
+	mtu int,
+	timeoutSet bool,
+	skips []skip,
+) {
+	rtt, source := "unknown", "user"
+	if !timeoutSet && path.RTTOK {
+		rtt, source = ms(path.RTT), "auto via "+path.Method
+	} else if path.RTTOK {
+		rtt = ms(path.RTT)
+	}
+
+	mtuStr := "unknown"
+	if mtu > 0 {
+		mtuStr = fmt.Sprint(mtu)
+	}
+
 	fmt.Printf(
-		"resolver=%s host=%s count=%d gap=%s timeout=%s warmup=%t\n",
-		cfg.ResolverIP, host, cfg.Count, cfg.Gap, cfg.Timeout, cfg.Warmup,
+		"resolver=%s host=%s rtt=%s mtu=%s count=%d gap=%s timeout=%s (%s) warmup=%t\n",
+		ip, host, rtt, mtuStr, cfg.Count, cfg.Gap, timeout, source, cfg.Warmup,
 	)
 
-	if len(skipped) > 0 {
-		fmt.Printf("skipping %s: encrypted transports need a hostname, not a bare IP\n",
-			strings.Join(skipped, ", "))
+	for _, s := range skips {
+		fmt.Printf("skipping %s: %s\n", s.name, s.reason)
 	}
 
 	fmt.Println()
