@@ -31,7 +31,8 @@ type Config struct {
 	// Timeout bounds a single exchange.
 	Timeout time.Duration
 
-	// PacketSize is the QUIC initial packet size, derived from the path MTU.
+	// PacketSize is the QUIC initial packet size; the RFC floor by default,
+	// grown by quic-go's path MTU discovery after the handshake.
 	PacketSize int
 }
 

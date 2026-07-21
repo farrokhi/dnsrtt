@@ -50,10 +50,6 @@ func TestProviderCapabilities(t *testing.T) {
 				want := capabilities[provider][key]
 				t.Run(key, func(t *testing.T) {
 					s := transports[key]
-					if s.quic && tgt.packetSize == 0 {
-						t.Skip("path MTU cannot carry QUIC")
-					}
-
 					if got := reaches(s, tgt, want); got != want {
 						t.Errorf("%s over %s: reachable=%v, want %v", key, provider, got, want)
 					}
@@ -79,9 +75,7 @@ func measuredTarget(t *testing.T, provider string) target {
 		timeout = probe.Budget(path.RTT)
 	}
 
-	size, _ := quicSizing(path.MTU, ip)
-
-	return target{host: host, ip: ip, timeout: timeout, packetSize: size}
+	return target{host: host, ip: ip, timeout: timeout, packetSize: probe.MinDatagram}
 }
 
 // reaches reports whether one query over s succeeds.  Cases expected to succeed

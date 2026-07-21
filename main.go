@@ -174,15 +174,17 @@ func main() {
 			}
 
 			// The initial QUIC packet must fit the path MTU or the handshake is
-			// a black hole; a user --mtu overrides what was measured.
-			effMTU := path.MTU
+			// a black hole.  The interface MTU is only a first-hop upper bound,
+			// not the path MTU, so default to the RFC floor (every QUIC path
+			// must carry it) and let quic-go grow it via PMTUD.  --mtu pins a
+			// larger size for a path known to allow it.
+			packetSize, quicOK := probe.MinDatagram, true
 			if cmd.Flags().Changed("mtu") {
-				effMTU = mtu
+				packetSize, quicOK = probe.PacketSize(mtu, ip)
 			}
-			packetSize, quicOK := quicSizing(effMTU, ip)
 
 			t := target{host: host, ip: ip, timeout: timeout, packetSize: packetSize}
-			targets, skips := buildTargets(transList, t, encrypted, quicOK, effMTU)
+			targets, skips := buildTargets(transList, t, encrypted, quicOK, mtu)
 			if len(targets) == 0 {
 				return fmt.Errorf("no transports to run")
 			}
@@ -194,7 +196,7 @@ func main() {
 				Names:  defaultNames,
 			}
 
-			printHeader(cfg, host, ip, timeout, path, effMTU, cmd.Flags().Changed("timeout"), skips)
+			printHeader(cfg, host, ip, timeout, path, packetSize, cmd.Flags().Changed("timeout"), skips)
 			printReport(bench.Run(cfg, targets))
 
 			return nil
@@ -207,7 +209,7 @@ func main() {
 	f.DurationVarP(&gap, "gap", "g", 0, "idle sleep between queries (e.g. 25s) to observe re-dials")
 	f.DurationVarP(&timeout, "timeout", "t", probe.DefaultBudget,
 		"per-query timeout (default: measured from path RTT)")
-	f.IntVar(&mtu, "mtu", 0, "path MTU for QUIC packet sizing (default: measured from egress interface)")
+	f.IntVar(&mtu, "mtu", 0, "pin the path MTU for QUIC packet sizing (default: RFC 1200-byte floor, grown by PMTUD)")
 	f.StringSliceVarP(&transList, "transports", "T", []string{"do53", "doq", "doh3"},
 		"transports to test: do53,dot,doq,doh2,doh3")
 	f.BoolVar(&noWarmup, "no-warmup", false, "do not send an untimed warm-up query first")
@@ -216,16 +218,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
-}
-
-// quicSizing turns an effective MTU into a QUIC packet size.  A zero or unknown
-// MTU falls back to the protocol minimum, which is safe on any path.
-func quicSizing(mtu int, ip netip.Addr) (size int, ok bool) {
-	if mtu <= 0 {
-		return probe.MinDatagram, true
-	}
-
-	return probe.PacketSize(mtu, ip)
 }
 
 // resolveTarget turns the TARGET argument into a (host, pinned IP) pair.  A
@@ -352,7 +344,7 @@ func printHeader(
 	ip netip.Addr,
 	timeout time.Duration,
 	path probe.Path,
-	mtu int,
+	packetSize int,
 	timeoutSet bool,
 	skips []skip,
 ) {
@@ -363,14 +355,14 @@ func printHeader(
 		rtt = ms(path.RTT)
 	}
 
-	mtuStr := "unknown"
-	if mtu > 0 {
-		mtuStr = fmt.Sprint(mtu)
+	quicpkt := "n/a"
+	if packetSize > 0 {
+		quicpkt = fmt.Sprintf("%dB", packetSize)
 	}
 
 	fmt.Printf(
-		"resolver=%s host=%s rtt=%s mtu=%s count=%d gap=%s timeout=%s (%s) warmup=%t\n",
-		ip, host, rtt, mtuStr, cfg.Count, cfg.Gap, timeout, source, cfg.Warmup,
+		"resolver=%s host=%s rtt=%s quicpkt=%s count=%d gap=%s timeout=%s (%s) warmup=%t\n",
+		ip, host, rtt, quicpkt, cfg.Count, cfg.Gap, timeout, source, cfg.Warmup,
 	)
 
 	for _, s := range skips {
@@ -393,7 +385,7 @@ func printReport(results []bench.Result) {
 
 			continue
 		case s.ProbeErr != nil:
-			fmt.Fprintf(w, "%s\tskipped: %v\n", s.Name, s.ProbeErr)
+			fmt.Fprintf(w, "%s\tunavailable: %s\n", s.Name, explain(s.Name, s.ProbeErr))
 
 			continue
 		}
